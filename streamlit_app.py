@@ -3,10 +3,12 @@
 # =========================================================
 
 import os
+import re
 import json
 import requests
 import pandas as pd
 from datetime import datetime, date
+from html import unescape
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from litellm import completion
@@ -19,23 +21,48 @@ load_dotenv()
 EVENTS_URL = "https://events.umich.edu/week/json?v=2"
 
 DEFAULT_MODEL = "gpt-4o-mini"
+TAG_RE = re.compile(r"<[^>]+>")
 
 
 # =========================================================
 # 1. Fetch events
 # =========================================================
-def fetch_umich_events():
-    resp = requests.get(EVENTS_URL, timeout=20)
+def clean_text(value):
+    if not value:
+        return ""
+    cleaned = TAG_RE.sub(" ", unescape(str(value)))
+    return " ".join(cleaned.split())
+
+
+def truncate(text, limit=1200):
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def _fetch_umich_events_cached():
+    resp = requests.get(EVENTS_URL, timeout=12)
     resp.raise_for_status()
     data = resp.json()
 
     if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and "events" in data:
-        return data["events"]
+        events = data
+    elif isinstance(data, dict) and "events" in data:
+        events = data["events"]
+    else:
+        raise ValueError(f"Unexpected UMich events JSON: {type(data)}")
 
-    print("Unexpected UMich events JSON:", type(data))
-    return []
+    fetched_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    return events, fetched_at
+
+
+def fetch_umich_events():
+    try:
+        events, fetched_at = _fetch_umich_events_cached()
+        return events, fetched_at, None
+    except Exception as exc:
+        return [], None, str(exc)
 
 
 # =========================================================
@@ -61,12 +88,30 @@ def filter_future_events(events, from_date=None):
 # =========================================================
 # 3. LLM helper
 # =========================================================
-def run_completion(model, messages, **kwargs):
+def ensure_llm_ready():
+    expected_keys = ["OPENAI_API_KEY", "LITELLM_API_KEY"]
+    missing = [k for k in expected_keys if not os.getenv(k)]
+    if len(missing) == len(expected_keys):
+        st.error("Missing API key. Set OPENAI_API_KEY or LITELLM_API_KEY.")
+        return False
+    return True
+
+
+@st.cache_resource(show_spinner=False)
+def get_completion_client():
+    return completion
+
+
+def run_completion(model, messages, response_format=None, **kwargs):
     try:
-        response = completion(
+        completion_kwargs = kwargs.copy()
+        if response_format:
+            completion_kwargs["response_format"] = response_format
+        client = get_completion_client()
+        response = client(
             model=model,
             messages=messages,
-            **kwargs
+            **completion_kwargs
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -79,7 +124,7 @@ def run_completion(model, messages, **kwargs):
 # =========================================================
 def analyze_event_with_llm(event, model=DEFAULT_MODEL, **kwargs):
     title = event.get("combined_title") or event.get("event_title") or ""
-    desc = event.get("description", "") or ""
+    desc = truncate(clean_text(event.get("description", "")))
     location = event.get("location_name") or event.get("building_name") or ""
     cost = event.get("cost", "") or ""
     tags = " ".join(event.get("tags", []))
@@ -114,7 +159,12 @@ def analyze_event_with_llm(event, model=DEFAULT_MODEL, **kwargs):
         {"role": "user",  "content": user_prompt},
     ]
 
-    content = run_completion(model, messages, **kwargs)
+    content = run_completion(
+        model,
+        messages,
+        response_format={"type": "json_object"},
+        **kwargs,
+    )
     if not content:
         return {"label": "none", "free_item": "", "free_details": ""}
 
@@ -147,8 +197,9 @@ def analyze_event_with_llm(event, model=DEFAULT_MODEL, **kwargs):
 def process_events_concurrent(events, model=DEFAULT_MODEL, max_workers=20, **kwargs):
     enriched = []
     futures = {}
+    worker_count = max(1, min(max_workers, os.cpu_count() * 4 if os.cpu_count() else max_workers, len(events) or 1))
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    with ThreadPoolExecutor(max_workers=worker_count) as ex:
         for idx, ev in enumerate(events):
             fut = ex.submit(analyze_event_with_llm, ev, model, **kwargs)
             futures[fut] = idx
@@ -193,7 +244,7 @@ def process_events_concurrent(events, model=DEFAULT_MODEL, max_workers=20, **kwa
 # =========================================================
 def analyze_professional_relevance(event, model=DEFAULT_MODEL, **kwargs):
     title = event.get("combined_title") or event.get("event_title") or ""
-    desc = event.get("description", "") or ""
+    desc = truncate(clean_text(event.get("description", "")))
     tags = " ".join(event.get("tags", []))
     orgs = "; ".join(
         o.get("group_name", "")
@@ -224,7 +275,12 @@ def analyze_professional_relevance(event, model=DEFAULT_MODEL, **kwargs):
         {"role": "user", "content": f"Evaluate this event:\n\n{text}"},
     ]
 
-    content = run_completion(model, messages, **kwargs)
+    content = run_completion(
+        model,
+        messages,
+        response_format={"type": "json_object"},
+        **kwargs,
+    )
     if not content:
         return {"is_helpful": False, "category": "general", "reason": ""}
 
@@ -242,8 +298,9 @@ def analyze_professional_relevance(event, model=DEFAULT_MODEL, **kwargs):
 def process_professional_events_concurrent(events, model=DEFAULT_MODEL, max_workers=20, **kwargs):
     helpful = []
     futures = {}
+    worker_count = max(1, min(max_workers, os.cpu_count() * 4 if os.cpu_count() else max_workers, len(events) or 1))
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    with ThreadPoolExecutor(max_workers=worker_count) as ex:
         for idx, ev in enumerate(events):
             fut = ex.submit(analyze_professional_relevance, ev, model, **kwargs)
             futures[fut] = idx
@@ -281,6 +338,23 @@ def process_professional_events_concurrent(events, model=DEFAULT_MODEL, max_work
     return helpful, categories
 
 
+def load_local_events(uploaded_file=None, path=None):
+    if uploaded_file:
+        try:
+            return json.load(uploaded_file), "uploaded file", None
+        except Exception as exc:
+            return [], None, f"Unable to read uploaded JSON: {exc}"
+    if path:
+        try:
+            with open(path, "r") as f:
+                return json.load(f), path, None
+        except FileNotFoundError:
+            return [], None, f"Local path not found: {path}"
+        except Exception as exc:
+            return [], None, f"Unable to read local JSON: {exc}"
+    return [], None, "No local file provided."
+
+
 # =========================================================
 # STREAMLIT UI
 # =========================================================
@@ -292,13 +366,46 @@ st.caption("Free events + professionally helpful events for PM/Tech career growt
 
 st.sidebar.header("Settings")
 
-max_workers = st.sidebar.slider("Max concurrent LLM workers", 5, 80, 20, step=5)
-temperature = st.sidebar.slider("Model temperature", 0.0, 1.0, 0.0, step=0.1)
+max_workers = st.sidebar.slider(
+    "Max concurrent LLM workers",
+    5,
+    80,
+    st.session_state.get("max_workers_slider", 20),
+    step=5,
+    key="max_workers_slider",
+)
+temperature = st.sidebar.slider(
+    "Model temperature",
+    0.0,
+    1.0,
+    st.session_state.get("temperature_slider", 0.0),
+    step=0.1,
+    key="temperature_slider",
+)
 
-show_free = st.sidebar.checkbox("Show free/free-ish events", value=True)
-show_prof = st.sidebar.checkbox("Show professionally helpful events", value=True)
+show_free = st.sidebar.checkbox("Show free/free-ish events", value=True, key="show_free")
+show_prof = st.sidebar.checkbox("Show professionally helpful events", value=True, key="show_prof")
 
-run_button = st.sidebar.button("Run Scan")
+enable_llm = st.sidebar.checkbox(
+    "Enable LLM calls (required for classifications)",
+    value=not st.session_state.get("use_local_only", False),
+    key="enable_llm",
+)
+
+st.sidebar.markdown("### Data source")
+use_local = st.sidebar.checkbox("Use local JSON (offline/demo)", value=False, key="use_local_only")
+local_path = st.sidebar.text_input(
+    "Local JSON path",
+    value="free_events_state.json",
+    disabled=not use_local,
+)
+uploaded_file = st.sidebar.file_uploader(
+    "Or upload events JSON",
+    type=["json"],
+    disabled=not use_local,
+)
+
+run_button = st.sidebar.button("Run Scan", type="primary")
 
 st.sidebar.markdown("---")
 st.sidebar.write("Today:", date.today().isoformat())
@@ -306,11 +413,38 @@ st.sidebar.write("Today:", date.today().isoformat())
 
 if run_button:
     with st.spinner("Fetching UMich events..."):
-        events_raw = fetch_umich_events()
-        events = filter_future_events(events_raw)
+        fetched_at = None
+        fetch_error = None
+        data_source = "UMich API"
 
-    st.write(f"Fetched **{len(events_raw)}** events total.")
-    st.write(f"Filtered to **{len(events)}** future events.\n")
+        if use_local:
+            events_raw, data_source, fetch_error = load_local_events(uploaded_file, local_path)
+            fetched_at = datetime.utcnow().isoformat(timespec="seconds") + "Z" if not fetch_error else None
+        else:
+            events_raw, fetched_at, fetch_error = fetch_umich_events()
+
+    if fetch_error:
+        st.error(fetch_error)
+        st.stop()
+
+    if not events_raw:
+        st.warning(f"No events returned from {data_source}.")
+        st.stop()
+
+    events = filter_future_events(events_raw)
+
+    st.write(f"Fetched **{len(events_raw)}** events from **{data_source}**.")
+    st.write(f"Filtered to **{len(events)}** future events.")
+    if fetched_at:
+        st.caption(f"Last updated: {fetched_at}")
+
+    if not enable_llm:
+        st.info("LLM disabled; showing future events only. Enable LLM to classify free/professional events.")
+        st.dataframe(pd.DataFrame(events), use_container_width=True)
+        st.stop()
+
+    if not ensure_llm_ready():
+        st.stop()
 
     tabs = []
     if show_free:
@@ -339,12 +473,34 @@ if run_button:
 
                 df_free = pd.DataFrame(enriched)
                 st.dataframe(df_free, use_container_width=True)
+                if not df_free.empty:
+                    st.download_button(
+                        "Download free events CSV",
+                        df_free.to_csv(index=False).encode("utf-8"),
+                        "free_events.csv",
+                        "text/csv",
+                    )
 
                 st.markdown("### Breakdown by category")
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Free Food", len(buckets["free_food"]))
                 c2.metric("Free Snacks", len(buckets["free_snacks"]))
                 c3.metric("Other Free Stuff", len(buckets["other_free"]))
+
+                for cat, rows in buckets.items():
+                    if not rows:
+                        continue
+                    with st.expander(f"{cat.replace('_', ' ').title()} ({len(rows)})"):
+                        for r in rows:
+                            md = (
+                                f"- **{r['title']}**  \n"
+                                f"  {r['date_start']} {r['time_start']} {r['time_zone']}  \n"
+                                f"  {r['location_name']}  \n"
+                                f"  *Free item:* {r['free_item']} — {r['free_details']}  \n"
+                                f"  {r['organizers']}  \n"
+                                f"  [Event Link]({r['permalink']})"
+                            )
+                            st.markdown(md)
 
         # ---------- PROFESSIONAL EVENTS TAB ----------
         if show_prof:
@@ -362,19 +518,26 @@ if run_button:
 
                 df_prof = pd.DataFrame(helpful)
                 st.dataframe(df_prof, use_container_width=True)
+                if not df_prof.empty:
+                    st.download_button(
+                        "Download professional events CSV",
+                        df_prof.to_csv(index=False).encode("utf-8"),
+                        "professional_events.csv",
+                        "text/csv",
+                    )
 
                 st.markdown("### Grouped by Category")
                 for cat, rows in categories.items():
-                    st.markdown(f"**{cat.upper()} ({len(rows)})**")
-                    for r in rows:
-                        md = (
-                            f"- **{r['title']}**  \n"
-                            f"  {r['date_start']} {r['time_start']}  \n"
-                            f"  {r['location']}  \n"
-                            f"  *Why helpful:* {r['reason']}  \n"
-                            f"  [Event Link]({r['link']})"
-                        )
-                        st.markdown(md)
+                    with st.expander(f"{cat.upper()} ({len(rows)})"):
+                        for r in rows:
+                            md = (
+                                f"- **{r['title']}**  \n"
+                                f"  {r['date_start']} {r['time_start']}  \n"
+                                f"  {r['location']}  \n"
+                                f"  *Why helpful:* {r['reason']}  \n"
+                                f"  [Event Link]({r['link']})"
+                            )
+                            st.markdown(md)
 
 else:
     st.info("Configure settings and click **Run Scan** to start.")
