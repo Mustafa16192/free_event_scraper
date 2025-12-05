@@ -2,7 +2,7 @@
 
 [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://freescraper.streamlit.app)
 
-**Live Demo:** [https://freescraper.streamlit.app](https://freescraper.streamlit.app)
+**Live At:** [https://freescraper.streamlit.app](https://freescraper.streamlit.app)
 
 A standalone Streamlit application that scrapes University of Michigan events and uses Large Language Models (LLMs) to identify:
 1.  **🍕 Free Stuff:** Events offering free food, snacks, or other perks.
