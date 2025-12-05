@@ -14,6 +14,7 @@ A standalone Streamlit application that scrapes University of Michigan events an
 -   **LLM Classification:** Uses GPT-4o-mini (via `litellm`) to analyze unstructured event descriptions.
 -   **Interactive Dashboard:** Filter events by category and view details including time, location, and specific "free" items.
 -   **Export:** Download filtered event lists as CSV files.
+-   **UMich Email Authentication:** Integrated authentication for "@umich" email addresses.
 
 ## Installation
 
