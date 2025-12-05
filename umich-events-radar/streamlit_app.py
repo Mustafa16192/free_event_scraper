@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from litellm import completion
 import streamlit as st
+from google_auth_oauthlib.flow import Flow
 
 # Load environment variables
 load_dotenv()
@@ -372,6 +373,120 @@ def load_local_events(uploaded_file=None, path=None):
 # =========================================================
 
 st.set_page_config(page_title="UMich Events Radar", page_icon="🔍", layout="wide")
+
+def check_authentication():
+    """
+    Enforce Google OAuth and restrict to @umich.edu emails.
+    Returns True if authenticated, False (stops execution) otherwise.
+    """
+    # 1. Check if already authenticated
+    if st.session_state.get("authenticated"):
+        return True
+
+    # 2. Load credentials
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+
+    # Handle multiple redirect URLs (e.g. "http://localhost:8501,https://myapp.streamlit.app")
+    redirect_urls_str = os.getenv("GOOGLE_REDIRECT_URL") or os.getenv("GOOGLE_REDIRECT_URI")
+    redirect_uri = "http://localhost:8501"  # Default fallback
+
+    if redirect_urls_str:
+        urls = [u.strip() for u in redirect_urls_str.split(',')]
+        
+        # Heuristic to detect if running on Streamlit Cloud
+        is_cloud = os.getenv("STREAMLIT_SHARING_MODE") is not None
+
+        localhost_url = next((u for u in urls if "localhost" in u or "127.0.0.1" in u), None)
+        remote_url = next((u for u in urls if "localhost" not in u and "127.0.0.1" not in u), None)
+
+        if is_cloud and remote_url:
+            redirect_uri = remote_url
+        elif localhost_url:
+            redirect_uri = localhost_url
+        elif remote_url:
+            redirect_uri = remote_url
+        elif urls:
+            redirect_uri = urls[0]
+
+    if not client_id or not client_secret:
+        st.warning("⚠️ Google OAuth not configured.")
+        st.info("To enable auth, set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `.env`.")
+        # Allow bypass if explicitly allowed (e.g. local dev without auth)
+        if os.getenv("ALLOW_UNAUTHENTICATED", "false").lower() == "true":
+            return True
+        st.stop()
+
+    # 3. Setup OAuth Flow
+    try:
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+            },
+            scopes=[
+                "https://www.googleapis.com/auth/userinfo.email",
+                "openid"
+            ],
+            redirect_uri=redirect_uri,
+        )
+    except Exception as e:
+        st.error(f"OAuth configuration error: {e}")
+        st.stop()
+
+    # 4. Handle Auth Code
+    code = st.query_params.get("code")
+    if code:
+        try:
+            flow.fetch_token(code=code)
+            credentials = flow.credentials
+            
+            user_info = requests.get(
+                "https://www.googleapis.com/oauth2/v1/userinfo",
+                headers={"Authorization": f"Bearer {credentials.token}"}
+            ).json()
+            
+            email = user_info.get("email", "")
+            if email.endswith("@umich.edu"):
+                st.session_state["authenticated"] = True
+                st.session_state["user_email"] = email
+                st.query_params.clear()
+                st.rerun()
+            else:
+                st.error("🚫 Access denied. Please sign in with a **@umich.edu** email.")
+                if st.button("Try Again"):
+                    st.query_params.clear()
+                    st.rerun()
+                st.stop()
+        except Exception as e:
+            st.error(f"Authentication failed: {e}")
+            st.stop()
+
+    # 5. Show Login Button
+    else:
+        auth_url, _ = flow.authorization_url(prompt="consent")
+        
+        c1, c2, c3 = st.columns([1, 2, 1])
+        with c2:
+            st.title("UMich Events Radar 🔒")
+            st.write("### Please sign in to continue")
+            st.info("Access is restricted to **@umich.edu** accounts.")
+            st.link_button("Sign in with Google", auth_url, type="primary", use_container_width=True)
+        st.stop()
+
+# Run Auth Check
+check_authentication()
+
+# Show User Info in Sidebar
+if st.session_state.get("authenticated"):
+    st.sidebar.write(f"👤 **{st.session_state.get('user_email')}**")
+    if st.sidebar.button("Logout"):
+        st.session_state.clear()
+        st.rerun()
 
 st.title("UMich Events Radar 🔍")
 st.caption("Free events + professionally helpful events for PM/Tech career growth.")
